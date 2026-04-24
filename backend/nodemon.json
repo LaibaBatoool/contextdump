@@ -1,0 +1,4 @@
+{
+  "watch": ["src"],
+  "ignore": ["data/*", "src/services/embeddings*"]
+}
