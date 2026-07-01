@@ -3,6 +3,62 @@ import { useParams, useNavigate } from "react-router-dom";
 import Navbar from "../components/Navbar";
 import api from "../utils/api";
 
+// Plays base64 audio returned from the voice endpoint
+function AudioPlayer({ audioBase64, mimeType = "audio/mpeg" }) {
+  const audioRef = useRef(null);
+  const [playing, setPlaying] = useState(false);
+
+  // Convert base64 → blob URL once when component mounts
+  const audioUrl = useRef(null);
+  useEffect(() => {
+    const bytes = atob(audioBase64);
+    const buffer = new Uint8Array(bytes.length);
+    for (let i = 0; i < bytes.length; i++) buffer[i] = bytes.charCodeAt(i);
+    const blob = new Blob([buffer], { type: mimeType });
+    audioUrl.current = URL.createObjectURL(blob);
+    return () => URL.revokeObjectURL(audioUrl.current); // cleanup
+  }, [audioBase64, mimeType]);
+
+  const toggle = () => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    if (playing) {
+      audio.pause();
+    } else {
+      audio.src = audioUrl.current;
+      audio.play();
+    }
+    setPlaying(!playing);
+  };
+
+  return (
+    <div className="flex items-center gap-2 mt-1">
+      <button
+        onClick={toggle}
+        className="flex items-center gap-1.5 text-xs text-violet-400 hover:text-violet-300 bg-violet-500/10 hover:bg-violet-500/20 border border-violet-500/20 px-2.5 py-1.5 rounded-lg transition-colors"
+      >
+        {playing ? (
+          // Pause icon
+          <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24">
+            <path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z" />
+          </svg>
+        ) : (
+          // Play icon
+          <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24">
+            <path d="M8 5v14l11-7L8 5z" />
+          </svg>
+        )}
+        {playing ? "Pause" : "Play response"}
+      </button>
+      <audio
+        ref={audioRef}
+        onEnded={() => setPlaying(false)}
+        className="hidden"
+      />
+    </div>
+  );
+}
+
 function ChatMessage({ message }) {
   const isUser = message.role === "user";
 
@@ -30,6 +86,11 @@ function ChatMessage({ message }) {
           }`}>
           {message.content}
         </div>
+
+        {/* Audio player — only on assistant messages that have audio */}
+        {!isUser && message.audio && (
+          <AudioPlayer audioBase64={message.audio} mimeType={message.audioMimeType} />
+        )}
 
         {/* Sources */}
         {!isUser && message.sources?.length > 0 && (
@@ -78,6 +139,12 @@ export default function RepoChat() {
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [loading, setLoading] = useState(true);
+
+  // Voice recording state
+  const [recording, setRecording] = useState(false);
+  const mediaRecorderRef = useRef(null);
+  const audioChunksRef = useRef([]);
+
   const bottomRef = useRef(null);
 
   useEffect(() => {
@@ -102,6 +169,7 @@ export default function RepoChat() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
+  // ── Text send (unchanged) ──────────────────────────────────────
   const handleSend = async (e) => {
     e.preventDefault();
     if (!input.trim() || sending) return;
@@ -136,6 +204,88 @@ export default function RepoChat() {
     }
   };
 
+  // ── Voice recording ────────────────────────────────────────────
+  const startRecording = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mediaRecorder = new MediaRecorder(stream);
+      mediaRecorderRef.current = mediaRecorder;
+      audioChunksRef.current = [];
+
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data.size > 0) audioChunksRef.current.push(e.data);
+      };
+
+      mediaRecorder.onstop = async () => {
+        // Stop all mic tracks so browser releases the microphone
+        stream.getTracks().forEach((t) => t.stop());
+
+        const audioBlob = new Blob(audioChunksRef.current, { type: "audio/webm" });
+        await sendVoiceMessage(audioBlob);
+      };
+
+      mediaRecorder.start();
+      setRecording(true);
+    } catch (err) {
+      alert("Microphone access denied. Please allow mic access and try again.");
+    }
+  };
+
+  const stopRecording = () => {
+    mediaRecorderRef.current?.stop();
+    setRecording(false);
+  };
+
+  const sendVoiceMessage = async (audioBlob) => {
+    setSending(true);
+
+    // Show a placeholder while we wait
+    const placeholderUser = {
+      _id: Date.now(),
+      role: "user",
+      content: "🎤 Voice message (transcribing...)",
+    };
+    setMessages((prev) => [...prev, placeholderUser]);
+
+    try {
+      const formData = new FormData();
+      formData.append("audio", audioBlob, "recording.webm");
+
+      const { data } = await api.post(`/chat/${id}/voice`, formData, {
+        headers: { "Content-Type": "multipart/form-data" },
+      });
+
+      // Replace placeholder with real transcribed text
+      setMessages((prev) =>
+        prev.map((m) =>
+          m._id === placeholderUser._id
+            ? { ...m, content: `🎤 ${data.transcribedText}` }
+            : m
+        )
+      );
+
+      // Add assistant response (with audio if TTS succeeded)
+      setMessages((prev) => [
+        ...prev,
+        {
+          ...data.message,
+          audio: data.audio,
+          audioMimeType: data.audioMimeType,
+        },
+      ]);
+    } catch (err) {
+      setMessages((prev) =>
+        prev.map((m) =>
+          m._id === placeholderUser._id
+            ? { ...m, content: "🎤 Voice message (failed to process)" }
+            : m
+        )
+      );
+    } finally {
+      setSending(false);
+    }
+  };
+
   const handleClear = async () => {
     if (!confirm("Clear chat history?")) return;
     await api.delete(`/chat/${id}`);
@@ -159,7 +309,6 @@ export default function RepoChat() {
     <div className="min-h-screen bg-[#0a0a0a] flex flex-col">
       <Navbar />
 
-      {/* Fixed background glow */}
       <div className="fixed top-0 left-0 w-[500px] h-[500px] bg-violet-600/5 rounded-full blur-[120px] pointer-events-none" />
 
       {/* Repo header */}
@@ -205,7 +354,6 @@ export default function RepoChat() {
         <div className="max-w-4xl mx-auto px-6 py-6 space-y-6">
 
           {messages.length === 0 ? (
-            /* Empty state with suggestions */
             <div className="flex flex-col items-center justify-center py-16 text-center">
               <div className="w-14 h-14 bg-violet-600/10 border border-violet-500/20 rounded-2xl flex items-center justify-center mb-4">
                 <svg className="w-6 h-6 text-violet-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -217,8 +365,6 @@ export default function RepoChat() {
               <p className="text-zinc-600 text-sm mb-8 max-w-sm">
                 The agent has indexed {repo?.stats?.totalChunks} code chunks and will cite exact file locations.
               </p>
-
-              {/* Suggestion chips */}
               <div className="flex flex-wrap gap-2 justify-center max-w-lg">
                 {suggestions.map((s) => (
                   <button
@@ -237,7 +383,6 @@ export default function RepoChat() {
             ))
           )}
 
-          {/* Thinking indicator */}
           {sending && (
             <div className="flex gap-3">
               <div className="w-7 h-7 rounded-full bg-zinc-800 border border-zinc-700 flex items-center justify-center shrink-0">
@@ -257,7 +402,7 @@ export default function RepoChat() {
         </div>
       </div>
 
-      {/* Input */}
+      {/* Input bar */}
       <div className="border-t border-zinc-800/50 bg-[#0a0a0a] sticky bottom-0">
         <div className="max-w-4xl mx-auto px-6 py-4">
           <form onSubmit={handleSend} className="flex gap-3">
@@ -266,12 +411,40 @@ export default function RepoChat() {
               value={input}
               onChange={(e) => setInput(e.target.value)}
               placeholder="Ask anything about this codebase..."
-              disabled={sending}
+              disabled={sending || recording}
               className="flex-1 bg-[#1a1a1a] border border-zinc-800 focus:border-violet-500 rounded-xl px-4 py-3 text-white text-sm placeholder-zinc-600 focus:outline-none transition-colors disabled:opacity-50"
             />
+
+            {/* Mic button */}
+            <button
+              type="button"
+              onClick={recording ? stopRecording : startRecording}
+              disabled={sending}
+              title={recording ? "Stop recording" : "Ask with voice"}
+              className={`px-4 py-3 rounded-xl transition-colors disabled:opacity-40 disabled:cursor-not-allowed
+                ${recording
+                  ? "bg-red-600 hover:bg-red-500 text-white animate-pulse"
+                  : "bg-zinc-800 hover:bg-zinc-700 text-zinc-400 hover:text-white border border-zinc-700"
+                }`}
+            >
+              {recording ? (
+                // Stop square icon when recording
+                <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+                  <rect x="4" y="4" width="16" height="16" rx="2" />
+                </svg>
+              ) : (
+                // Mic icon when idle
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                    d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
+                </svg>
+              )}
+            </button>
+
+            {/* Send button */}
             <button
               type="submit"
-              disabled={sending || !input.trim()}
+              disabled={sending || !input.trim() || recording}
               className="bg-violet-600 hover:bg-violet-500 disabled:opacity-40 disabled:cursor-not-allowed text-white px-4 py-3 rounded-xl transition-colors"
             >
               <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -279,6 +452,14 @@ export default function RepoChat() {
               </svg>
             </button>
           </form>
+
+          {/* Recording hint */}
+          {recording && (
+            <p className="text-red-400 text-xs mt-2 flex items-center gap-1.5">
+              <span className="w-1.5 h-1.5 bg-red-400 rounded-full animate-pulse" />
+              Recording... click the stop button when done
+            </p>
+          )}
         </div>
       </div>
 
