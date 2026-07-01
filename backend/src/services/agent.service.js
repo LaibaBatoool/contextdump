@@ -26,8 +26,9 @@ const TOOLS = [
             description: "What you are searching for in the codebase",
           },
           topK: {
-            type: "number",
-            description: "How many results to return, default is 5",
+            type: "integer",  // change "number" to "integer" if it says number
+            description: "Number of results to return. Must be an integer, not a string. Use 5.",
+            default: 5,
           },
         },
         required: ["query"],
@@ -97,7 +98,8 @@ export const runAgent = async (question, vectorStorePath, chatHistory = []) => {
 You have tools to search and retrieve code from the repository.
 Always use a tool first before answering.
 Be specific, cite file paths and line numbers in your answers.
-Explain code clearly as if talking to a fellow developer.`;
+Explain code clearly as if talking to a fellow developer.
+When calling search_codebase, topK must always be an integer like 5, never a string like "5".`;
 
   const messages = [
     { role: "system", content: systemPrompt },
@@ -105,102 +107,118 @@ Explain code clearly as if talking to a fellow developer.`;
     { role: "user", content: question },
   ];
 
-  // Step 1 — Let the agent decide which tool to use
-  const toolCallResponse = await getGroq().chat.completions.create({
-    model: "llama-3.3-70b-versatile",
-    messages,
-    tools: TOOLS,
-    tool_choice: "auto",
-  });
+  const MAX_RETRIES = 3;
 
-  const assistantMessage = toolCallResponse.choices[0].message;
-  let sources = [];
-  let toolUsed = null;
-  let toolResult = "";
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      // Step 1 — Let the agent decide which tool to use
+      const toolCallResponse = await getGroq().chat.completions.create({
+        model: "llama-3.3-70b-versatile",
+        messages,
+        tools: TOOLS,
+        tool_choice: "auto",
+      });
 
-  // Step 2 — Execute whichever tool the agent chose
-  if (assistantMessage.tool_calls?.length > 0) {
-    const toolCall = assistantMessage.tool_calls[0];
-    toolUsed = toolCall.function.name;
-    const args = JSON.parse(toolCall.function.arguments);
+      const assistantMessage = toolCallResponse.choices[0].message;
+      let sources = [];
+      let toolUsed = null;
+      let toolResult = "";
 
-    console.log(`Agent using tool: ${toolUsed}`, args);
+      // Step 2 — Execute whichever tool the agent chose
+      if (assistantMessage.tool_calls?.length > 0) {
+        const toolCall = assistantMessage.tool_calls[0];
+        toolUsed = toolCall.function.name;
 
-    if (toolUsed === "search_codebase") {
-      const embedding = await getEmbedding(args.query);
-      const results = store.search(embedding, args.topK || 5);
-      sources = results.map((r) => ({
-        filePath: r.metadata.filePath,
-        lineStart: r.metadata.lineStart,
-        lineEnd: r.metadata.lineEnd,
-        snippet: r.metadata.snippet,
-      }));
-      toolResult = results.map((r) => r.metadata.content).join("\n\n---\n\n");
+        // Parse args and force topK to a number defensively
+        const args = JSON.parse(toolCall.function.arguments);
+        if (args.topK) args.topK = parseInt(args.topK, 10) || 5;
+
+        console.log(`Agent using tool: ${toolUsed}`, args);
+
+        if (toolUsed === "search_codebase") {
+          const embedding = await getEmbedding(args.query);
+          const results = store.search(embedding, args.topK || 5);
+          sources = results.map((r) => ({
+            filePath: r.metadata.filePath,
+            lineStart: r.metadata.lineStart,
+            lineEnd: r.metadata.lineEnd,
+            snippet: r.metadata.snippet,
+          }));
+          toolResult = results.map((r) => r.metadata.content).join("\n\n---\n\n");
+        }
+
+        else if (toolUsed === "get_file") {
+          const results = store.metadata
+            .filter((m) => m.filePath.includes(args.filePath))
+            .slice(0, 10);
+          sources = results.map((r) => ({
+            filePath: r.filePath,
+            lineStart: r.lineStart,
+            lineEnd: r.lineEnd,
+            snippet: r.snippet,
+          }));
+          toolResult = results.map((r) => r.content).join("\n\n");
+        }
+
+        else if (toolUsed === "explain_function") {
+          const embedding = await getEmbedding(`function ${args.functionName}`);
+          const results = store.search(embedding, 3);
+          sources = results.map((r) => ({
+            filePath: r.metadata.filePath,
+            lineStart: r.metadata.lineStart,
+            lineEnd: r.metadata.lineEnd,
+            snippet: r.metadata.snippet,
+          }));
+          toolResult = results.map((r) => r.metadata.content).join("\n\n---\n\n");
+        }
+
+        else if (toolUsed === "generate_docs") {
+          const embedding = await getEmbedding(args.target);
+          const results = store.search(embedding, 8);
+          sources = results.map((r) => ({
+            filePath: r.metadata.filePath,
+            lineStart: r.metadata.lineStart,
+            lineEnd: r.metadata.lineEnd,
+            snippet: r.metadata.snippet,
+          }));
+          toolResult = results.map((r) => r.metadata.content).join("\n\n---\n\n");
+        }
+
+        // Step 3 — Send tool result back for final answer
+        const finalResponse = await getGroq().chat.completions.create({
+          model: "llama-3.3-70b-versatile",
+          messages: [
+            ...messages,
+            assistantMessage,
+            {
+              role: "tool",
+              tool_call_id: toolCall.id,
+              content: toolResult || "No results found.",
+            },
+          ],
+        });
+
+        return {
+          answer: finalResponse.choices[0].message.content,
+          sources,
+          toolUsed,
+        };
+      }
+
+      // Agent answered directly without a tool
+      return {
+        answer: assistantMessage.content,
+        sources: [],
+        toolUsed: null,
+      };
+
+    } catch (err) {
+      console.warn(`Agent attempt ${attempt}/${MAX_RETRIES} failed:`, err.message);
+      if (attempt === MAX_RETRIES) {
+        throw new Error(`Agent failed after ${MAX_RETRIES} attempts: ${err.message}`);
+      }
+      // Small delay before retrying so we don't hammer the API
+      await new Promise((res) => setTimeout(res, 500));
     }
-
-    else if (toolUsed === "get_file") {
-      const results = store.metadata
-        .filter((m) => m.filePath.includes(args.filePath))
-        .slice(0, 10);
-      sources = results.map((r) => ({
-        filePath: r.filePath,
-        lineStart: r.lineStart,
-        lineEnd: r.lineEnd,
-        snippet: r.snippet,
-      }));
-      toolResult = results.map((r) => r.content).join("\n\n");
-    }
-
-    else if (toolUsed === "explain_function") {
-      const embedding = await getEmbedding(`function ${args.functionName}`);
-      const results = store.search(embedding, 3);
-      sources = results.map((r) => ({
-        filePath: r.metadata.filePath,
-        lineStart: r.metadata.lineStart,
-        lineEnd: r.metadata.lineEnd,
-        snippet: r.metadata.snippet,
-      }));
-      toolResult = results.map((r) => r.metadata.content).join("\n\n---\n\n");
-    }
-
-    else if (toolUsed === "generate_docs") {
-      const embedding = await getEmbedding(args.target);
-      const results = store.search(embedding, 8);
-      sources = results.map((r) => ({
-        filePath: r.metadata.filePath,
-        lineStart: r.metadata.lineStart,
-        lineEnd: r.metadata.lineEnd,
-        snippet: r.metadata.snippet,
-      }));
-      toolResult = results.map((r) => r.metadata.content).join("\n\n---\n\n");
-    }
-
-    // Step 3 — Send tool result back to agent for final answer
-    const finalResponse = await getGroq().chat.completions.create({
-
-      model: "llama-3.3-70b-versatile",
-      messages: [
-        ...messages,
-        assistantMessage,
-        {
-          role: "tool",
-          tool_call_id: toolCall.id,
-          content: toolResult || "No results found.",
-        },
-      ],
-    });
-
-    return {
-      answer: finalResponse.choices[0].message.content,
-      sources,
-      toolUsed,
-    };
   }
-
-  // Agent answered directly without a tool
-  return {
-    answer: assistantMessage.content,
-    sources: [],
-    toolUsed: null,
-  };
 };
