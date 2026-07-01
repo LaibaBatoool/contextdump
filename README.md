@@ -21,6 +21,9 @@ Fast inference — powered by Groq (300-1000+ tokens/sec)
 
 Free embeddings — runs HuggingFace model locally, no OpenAI key needed
 
+Voice input — ask questions by speaking, answers are spoken back via TTS
+
+Local STT/TTS — Whisper runs on-device, edge-tts uses free Microsoft neural voices
 
 ## Demo
 
@@ -46,6 +49,9 @@ Free embeddings — runs HuggingFace model locally, no OpenAI key needed
 | `Embeddings`           | HuggingFace all-MiniLM-L6-v2                     |
 | `LLM + Agent`          | Groq API — llama-3.3-70b-versatile               |
 | `Auth`                 | JWT                                              |
+| `Speech-to-Text`       | faster-whisper (OpenAI Whisper, runs locally)    |
+| `Text-to-Speech`       | edge-tts (Microsoft Neural voices, free)         |
+| `Voice Microservice`   | Python FastAPI                                   |
 
 # Project Structure
 <img width="539" height="771" alt="image" src="https://github.com/user-attachments/assets/e8c893f1-d109-4c52-861f-ca18baa048a2" />
@@ -108,6 +114,21 @@ npm run dev
 
 http://localhost:5173
 
+## Voice Setup (optional)
+
+The voice feature requires a separate Python microservice for Whisper STT.
+
+**Prerequisites:** Python 3.10+
+
+1. cd whisper-service
+2. python -m venv venv && venv\Scripts\activate
+3. pip install fastapi uvicorn faster-whisper python-multipart edge-tts
+4. uvicorn main:app --port 8001
+
+⚠️ First run downloads the Whisper base model (~150MB). This only happens once.
+
+Once running, the mic button in the chat UI will be active.
+
 # API Reference
 `Auth:`
 POST   /api/auth/register    { name, email, password }
@@ -133,6 +154,8 @@ POST   /api/chat/:repoId     { content }
 GET    /api/chat/:repoId
 
 DELETE /api/chat/:repoId
+
+POST   /api/chat/:repoId/voice    multipart/form-data: audio file
 
 # Why Smart Chunking?
 Most RAG tutorials chunk by character count (every 500 chars). That's bad for code — it splits functions in half and loses context.
